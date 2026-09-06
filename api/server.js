@@ -1,5 +1,5 @@
 /* opengym-api — passkey (WebAuthn) auth + per-user state storage for openGym
-   No framework, JSON-file storage, signed session cookies.               */
+   Storage: Upstash Redis (cloud) or local JSON files (docker/dev).       */
 import http from 'node:http';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -13,6 +13,7 @@ import * as coachConfig from './coach/config.js';
 import * as coachJobs from './coach/jobs.js';
 import { coachRoutes } from './coach/routes.js';
 import { startCadence } from './coach/cadence.js';
+import { kvGet, kvSet, kvSetBg } from './storage.js';
 
 const PORT = +(process.env.PORT || 3000);
 const DATA = process.env.DATA_DIR || '/data';
@@ -32,42 +33,18 @@ const MAX_BODY = 5 * 1024 * 1024;
 // Secure cookies require HTTPS; over plain http://localhost the flag would drop the cookie
 const SECURE = /^https:/i.test(ORIGIN) ? ' Secure;' : '';
 
-fs.mkdirSync(DATA, { recursive: true });
-// 0700 is what stops the unprivileged user that Coach jobs run as from reading any of this —
-// state files, db.json, the session secret, the provider credential. The Agent SDK process gets
-// its job payload in a temp directory and nothing else. Best-effort: a bind-mounted host directory
-// may refuse the chmod, and that is not a reason to refuse to boot.
-try { fs.chmodSync(DATA, 0o700); } catch { /* host filesystem says no — carry on */ }
-
-/* ---------- secret + db ---------- */
-const secretFile = path.join(DATA, 'secret');
-if (!fs.existsSync(secretFile)) fs.writeFileSync(secretFile, crypto.randomBytes(32).toString('hex'), { mode: 0o600 });
-const SECRET = fs.readFileSync(secretFile, 'utf8').trim();
-
-const dbFile = path.join(DATA, 'db.json');
+/* ---------- secret + db (loaded asynchronously in main()) ---------- */
+// storage.js handles mkdirSync / chmodSync in local mode — nothing to do here.
+let SECRET;
 let db = { users: [], creds: [], subs: [], invites: [] };
-try { db = JSON.parse(fs.readFileSync(dbFile, 'utf8')); } catch {}
-db.subs = db.subs || [];
-db.invites = db.invites || [];
-const isAdmin = user => !!user && (user.admin === true || ADMIN_UIDS.includes(user.id));
-function saveDb() { atomicWrite(dbFile, JSON.stringify(db, null, 2)); }
-function atomicWrite(file, content) {
-  const tmp = file + '.tmp';
-  fs.writeFileSync(tmp, content);
-  fs.renameSync(tmp, file);
-}
-const stateFile = uid => path.join(DATA, 'state-' + uid.replace(/[^a-zA-Z0-9_-]/g, '') + '.json');
-function readState(uid) {
-  try { return JSON.parse(fs.readFileSync(stateFile(uid), 'utf8')); } catch { return null; }
-}
-
-/* ---------- push notifications (Web Push / VAPID) ---------- */
-const vapidFile = path.join(DATA, 'vapid.json');
 let vapid;
-try { vapid = JSON.parse(fs.readFileSync(vapidFile, 'utf8')); }
-catch { vapid = webpush.generateVAPIDKeys(); fs.writeFileSync(vapidFile, JSON.stringify(vapid), { mode: 0o600 }); }
+
+const isAdmin = user => !!user && (user.admin === true || ADMIN_UIDS.includes(user.id));
+function saveDb() { kvSetBg('db', db); }
+async function readState(uid) { return kvGet('state:' + uid.replace(/[^a-zA-Z0-9_-]/g, '')); }
+
 const VAPID_SUBJECT = process.env.VAPID_SUBJECT || (SECURE ? ORIGIN : 'mailto:admin@localhost');
-webpush.setVapidDetails(VAPID_SUBJECT, vapid.publicKey, vapid.privateKey);
+
 
 async function sendPush(userId, payload) {
   const subs = db.subs.filter(s => s.userId === userId);
@@ -131,10 +108,10 @@ function userNow(tz) {
     return { date, hhmm: `${g('hour')}:${g('minute')}`, weekday: new Date(date + 'T12:00:00Z').getUTCDay() };
   } catch { return null; } // unknown/invalid tz string — skip this user rather than guess
 }
-setInterval(() => {
+setInterval(async () => {
   for (const user of db.users) {
     if (!db.subs.some(s => s.userId === user.id)) continue;
-    const S = readState(user.id);
+    const S = await readState(user.id);
     if (!S?.reminder?.on) continue;
     const now = userNow(S.reminder.tz || 'UTC');
     if (!now || S.reminder.time !== now.hhmm) continue;
@@ -393,10 +370,8 @@ const routes = {
   'GET /api/data': async (req, res) => {
     const user = readSession(req);
     if (!user) return json(res, 401, { error: 'not signed in' });
-    try {
-      const state = JSON.parse(fs.readFileSync(stateFile(user.id), 'utf8'));
-      json(res, 200, { state });
-    } catch { json(res, 200, { state: null }); }
+    const state = await readState(user.id);
+    json(res, 200, { state: state || null });
   },
 
   'PUT /api/data': async (req, res) => {
@@ -405,7 +380,7 @@ const routes = {
     const body = await readBody(req);
     if (!body.state || typeof body.state !== 'object') return json(res, 400, { error: 'state required' });
     delete body.state.active;              // in-progress workouts stay device-local
-    atomicWrite(stateFile(user.id), JSON.stringify(body.state));
+    kvSetBg('state:' + user.id.replace(/[^a-zA-Z0-9_-]/g, ''), body.state);
     json(res, 200, { ok: true, ts: body.state._ts || null });
   },
 
@@ -477,8 +452,9 @@ const routes = {
   // One row per user, cheap enough for a personal instance (reads each state file once).
   'GET /api/admin/users': async (req, res) => {
     if (!requireAdmin(req, res)) return;
-    const users = db.users.map(u => {
-      const S = readState(u.id) || {};
+    const states = await Promise.all(db.users.map(u => readState(u.id)));
+    const users = db.users.map((u, i) => {
+      const S = states[i] || {};
       const workouts = S.workouts || [];
       const last = workouts[workouts.length - 1];
       return {
@@ -500,7 +476,7 @@ const routes = {
     const id = new URL(req.url, 'http://x').searchParams.get('id');
     const u = db.users.find(x => x.id === id);
     if (!u) return json(res, 404, { error: 'no such user' });
-    const S = readState(u.id) || {};
+    const S = (await readState(u.id)) || {};
     json(res, 200, {
       user: { id: u.id, name: u.name, created: u.created || null, disabled: !!u.disabled, admin: isAdmin(u), invitedBy: u.invitedBy || null },
       unit: S.unit || 'kg',
@@ -582,14 +558,46 @@ coachJobs.setProposalHook((uid, pending) => {
 });
 startCadence({ users: () => db.users, userNow });
 
-http.createServer(async (req, res) => {
-  const url = new URL(req.url, 'http://x');
-  const key = req.method + ' ' + url.pathname;
-  const handler = routes[key];
-  if (!handler) return json(res, 404, { error: 'not found' });
-  try { await handler(req, res); }
-  catch (e) {
-    console.error(key, e);
-    if (!res.headersSent) json(res, 500, { error: 'server error' });
+/* ---------- Async startup: load db / secret / vapid from KV then listen ---------- */
+async function main() {
+  // Load (or generate) the session signing secret
+  let storedSecret = await kvGet('secret');
+  if (!storedSecret) {
+    storedSecret = crypto.randomBytes(32).toString('hex');
+    await kvSet('secret', storedSecret);
   }
-}).listen(PORT, () => console.log(`gym-api on :${PORT} (rpID=${RP_ID}, origin=${ORIGIN})`));
+  SECRET = typeof storedSecret === 'string' ? storedSecret.trim() : storedSecret.trim();
+
+  // Load the user database
+  const storedDb = await kvGet('db');
+  if (storedDb) {
+    db = storedDb;
+    db.subs    = db.subs    || [];
+    db.invites = db.invites || [];
+  }
+
+  // Load (or generate) VAPID keys for push notifications
+  const storedVapid = await kvGet('vapid');
+  if (storedVapid) {
+    vapid = storedVapid;
+  } else {
+    vapid = webpush.generateVAPIDKeys();
+    await kvSet('vapid', vapid);
+  }
+  webpush.setVapidDetails(VAPID_SUBJECT, vapid.publicKey, vapid.privateKey);
+
+  http.createServer(async (req, res) => {
+    const url = new URL(req.url, 'http://x');
+    const key = req.method + ' ' + url.pathname;
+    const handler = routes[key];
+    if (!handler) return json(res, 404, { error: 'not found' });
+    try { await handler(req, res); }
+    catch (e) {
+      console.error(key, e);
+      if (!res.headersSent) json(res, 500, { error: 'server error' });
+    }
+  }).listen(PORT, () => console.log(`gym-api on :${PORT} (rpID=${RP_ID}, origin=${ORIGIN})`));
+}
+
+main().catch(err => { console.error('Startup failed:', err); process.exit(1); });
+

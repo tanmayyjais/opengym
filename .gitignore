@@ -10,9 +10,15 @@ data/
 
 # Build output / deps
 frontend/dist/
+frontend/node_modules/
+api/node_modules/
 node_modules/
 *.log
 .DS_Store
+
+# Environment files with secrets — never commit these
+.env
+api/.env
 
 # Local AI-assistant tooling — contributor's own setup, not part of the app
 .claude/
@@ -20,3 +26,4 @@ node_modules/
 CLAUDE.md
 AGENTS.md
 graphify-out/
+.vercel

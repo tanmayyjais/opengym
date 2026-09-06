@@ -6,7 +6,7 @@ const media = process.env.MEDIA_TARGET || 'http://127.0.0.1:8888'
 
 export default defineConfig({
   plugins: [react()],
-  base: './',
+  base: '/',
   server: {
     proxy: {
       '/api': { target: backend, changeOrigin: true },

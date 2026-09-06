@@ -1,0 +1,48 @@
+# render.yaml — One-click Render.com deployment for openGym API
+# Instructions:
+#   1. Push this repo to your own GitHub account
+#   2. Go to https://render.com → New → Blueprint → connect your repo
+#   3. Fill in the environment variables marked REQUIRED below
+#   4. Deploy — Render will install dependencies and start the API automatically
+#
+# Free tier note: the service sleeps after 15 min of inactivity.
+# First request after sleep takes ~30s. Perfectly fine for personal use.
+
+services:
+  - type: web
+    name: opengym-api
+    runtime: node
+    rootDir: api
+    buildCommand: npm install
+    startCommand: node server.js
+    plan: free
+    envVars:
+      # ── WebAuthn / Passkeys ─────────────────────────────────────────────────
+      # REQUIRED: Set these to your Vercel domain BEFORE creating your first passkey.
+      # Changing RP_ID later invalidates all existing passkeys.
+      - key: RP_ID
+        value: opengym-tanmay.vercel.app
+      - key: ORIGIN
+        value: https://opengym-tanmay.vercel.app
+      - key: RP_NAME
+        value: openGym
+
+      # ── Persistent Storage (Upstash Redis) ──────────────────────────────────
+      # REQUIRED: Create a free Redis database at https://upstash.com
+      # Then copy the REST URL and REST Token from the Upstash console.
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false   # paste value in Render dashboard
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false   # paste value in Render dashboard
+
+      # ── Optional ────────────────────────────────────────────────────────────
+      # Uncomment and fill in ADMIN_UIDS after your first login.
+      # Find your user ID in the app's Settings page.
+      # - key: ADMIN_UIDS
+      #   value: your-user-id-here
+      # - key: INVITE_ONLY
+      #   value: "1"
+      - key: PORT
+        value: "3000"
+      - key: COACH_DISABLED
+        value: "1"    # disable AI coach by default; enable later if desired
